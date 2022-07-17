@@ -376,6 +376,11 @@ using ContentReceiver =
 using MultipartContentHeader =
     std::function<bool(const MultipartFormData &file)>;
 
+// forward declaration required to make typedefs work
+class Stream;
+using StreamManager = std::function<bool(Stream &strm)>;
+using CustomProtocolHandlers =
+    std::multimap<std::string, StreamManager, detail::ci>;
 class ContentReader {
 public:
   using Reader = std::function<bool(ContentReceiver receiver)>;
@@ -423,6 +428,8 @@ struct Request {
   ResponseHandler response_handler;
   ContentReceiverWithProgress content_receiver;
   Progress progress;
+  CustomProtocolHandlers alt_protocol_handlers;
+  std::string forced_alt_protocol;
 #ifdef CPPHTTPLIB_OPENSSL_SUPPORT
   const SSL *ssl = nullptr;
 #endif
@@ -485,6 +492,9 @@ struct Response {
       const char *content_type, ContentProviderWithoutLength provider,
       ContentProviderResourceReleaser resource_releaser = nullptr);
 
+  void use_custom_protocol(
+      const char *protocol_name, StreamManager custom_protocol_handler);
+
   Response() = default;
   Response(const Response &) = default;
   Response &operator=(const Response &) = default;
@@ -500,6 +510,7 @@ struct Response {
   size_t content_length_ = 0;
   ContentProvider content_provider_;
   ContentProviderResourceReleaser content_provider_resource_releaser_;
+  StreamManager custom_protocol_handler_;
   bool is_chunked_content_provider_ = false;
   bool content_provider_success_ = false;
 };
@@ -863,6 +874,11 @@ public:
 
   Result Get(const char *path);
   Result Get(const char *path, const Headers &headers);
+  Result Get(const char *path, const Headers &headers,
+             CustomProtocolHandlers &protocol_handlers, const char *force_protocol = "");
+  Result Get(const char *path, const Headers &headers,
+             ResponseHandler response_handler,
+             CustomProtocolHandlers &protocol_handlers, const char *force_protocol = "");
   Result Get(const char *path, Progress progress);
   Result Get(const char *path, const Headers &headers, Progress progress);
   Result Get(const char *path, ContentReceiver content_receiver);
@@ -1172,7 +1188,7 @@ private:
   std::string adjust_host_string(const std::string &host) const;
 
   virtual bool process_socket(const Socket &socket,
-                              std::function<bool(Stream &strm)> callback);
+                              StreamManager callback);
   virtual bool is_ssl() const;
 };
 
@@ -1200,6 +1216,11 @@ public:
 
   Result Get(const char *path);
   Result Get(const char *path, const Headers &headers);
+  Result Get(const char *path, const Headers &headers,
+             CustomProtocolHandlers &protocol_handlers, const char *force_protocol = "");
+  Result Get(const char *path, const Headers &headers,
+             ResponseHandler response_handler,
+             CustomProtocolHandlers &protocol_handlers, const char *force_protocol = "");
   Result Get(const char *path, Progress progress);
   Result Get(const char *path, const Headers &headers, Progress progress);
   Result Get(const char *path, ContentReceiver content_receiver);
@@ -1443,7 +1464,7 @@ private:
   void shutdown_ssl_impl(Socket &socket, bool shutdown_socket);
 
   bool process_socket(const Socket &socket,
-                      std::function<bool(Stream &strm)> callback) override;
+                      StreamManager callback) override;
   bool is_ssl() const override;
 
   bool connect_with_proxy(Socket &sock, Response &res, bool &success,
@@ -4583,6 +4604,24 @@ inline void Response::set_chunked_content_provider(
   is_chunked_content_provider_ = true;
 }
 
+inline void Response::use_custom_protocol(
+    const char *protocol_name, StreamManager custom_protocol_handler) {
+  std::string connection_header = "Upgrade";
+  if (has_header("Connection")) {
+    std::string header_value = get_header_value("Connection");
+    if (header_value.find(connection_header) == std::string::npos) {
+      connection_header.append(", " + header_value);
+    } else {
+      connection_header = std::move(header_value);
+    }
+  }
+  if (status == -1) { status = 101; }
+  set_header("Connection", std::move(connection_header));
+  set_header("Upgrade", protocol_name);
+  custom_protocol_handler_ = custom_protocol_handler;
+}
+
+
 // Result implementation
 inline bool Result::has_request_header(const char *key) const {
   return request_headers_.find(key) != request_headers_.end();
@@ -5100,6 +5139,8 @@ inline bool Server::write_response_core(Stream &strm, bool close_connection,
         res.content_provider_success_ = false;
         ret = false;
       }
+    } else if (res.custom_protocol_handler_) {
+      ret = res.custom_protocol_handler_(strm);
     }
   }
 
@@ -6423,38 +6464,66 @@ inline bool ClientImpl::process_request(Stream &strm, Request &req,
       }
     }
 
-    auto out =
-        req.content_receiver
-            ? static_cast<ContentReceiverWithProgress>(
-                  [&](const char *buf, size_t n, uint64_t off, uint64_t len) {
-                    if (redirect) { return true; }
-                    auto ret = req.content_receiver(buf, n, off, len);
-                    if (!ret) { error = Error::Canceled; }
-                    return ret;
-                  })
-            : static_cast<ContentReceiverWithProgress>(
-                  [&](const char *buf, size_t n, uint64_t /*off*/,
-                      uint64_t /*len*/) {
-                    if (res.body.size() + n > res.body.max_size()) {
-                      return false;
-                    }
-                    res.body.append(buf, n);
-                    return true;
-                  });
+    if(!req.forced_alt_protocol.empty()
+        && !redirect
+        && req.alt_protocol_handlers.find(req.forced_alt_protocol) != req.alt_protocol_handlers.end()) {
+      if(!req.alt_protocol_handlers.find(req.forced_alt_protocol)->second(strm)) {
+        error = Error::Canceled;
+        return false;
+      }
+    }
+    else if(res.status == 101 && res.has_header("Upgrade")) {
+      std::stringstream parse_upgrade_header(res.get_header_value("Upgrade"));
+      bool protocol_negotiated = false;
+      while(parse_upgrade_header.good()) {
+        std::string protocol_name;
+        std::getline(parse_upgrade_header, protocol_name, ',');
+        if(req.alt_protocol_handlers.find(protocol_name) != req.alt_protocol_handlers.end()) {
+          protocol_negotiated = true;
+          if(!req.alt_protocol_handlers.find(protocol_name)->second(strm)) {
+            error = Error::Canceled;
+            return false;
+          }
+        }
+      }
+      if(!protocol_negotiated) {
+        error = Error::Canceled;
+        return false;
+      }
+    } else {
+      auto out =
+          req.content_receiver
+              ? static_cast<ContentReceiverWithProgress>(
+                    [&](const char *buf, size_t n, uint64_t off, uint64_t len) {
+                      if (redirect) { return true; }
+                      auto ret = req.content_receiver(buf, n, off, len);
+                      if (!ret) { error = Error::Canceled; }
+                      return ret;
+                    })
+              : static_cast<ContentReceiverWithProgress>(
+                    [&](const char *buf, size_t n, uint64_t /*off*/,
+                        uint64_t /*len*/) {
+                      if (res.body.size() + n > res.body.max_size()) {
+                        return false;
+                      }
+                      res.body.append(buf, n);
+                      return true;
+                    });
 
-    auto progress = [&](uint64_t current, uint64_t total) {
-      if (!req.progress || redirect) { return true; }
-      auto ret = req.progress(current, total);
-      if (!ret) { error = Error::Canceled; }
-      return ret;
-    };
+      auto progress = [&](uint64_t current, uint64_t total) {
+        if (!req.progress || redirect) { return true; }
+        auto ret = req.progress(current, total);
+        if (!ret) { error = Error::Canceled; }
+        return ret;
+      };
 
-    int dummy_status;
-    if (!detail::read_content(strm, res, (std::numeric_limits<size_t>::max)(),
-                              dummy_status, std::move(progress), std::move(out),
-                              decompress_)) {
-      if (error != Error::Canceled) { error = Error::Read; }
-      return false;
+      int dummy_status;
+      if (!detail::read_content(strm, res, (std::numeric_limits<size_t>::max)(),
+                                dummy_status, std::move(progress), std::move(out),
+                                decompress_)) {
+        if (error != Error::Canceled) { error = Error::Read; }
+        return false;
+      }
     }
   }
 
@@ -6484,7 +6553,7 @@ inline bool ClientImpl::process_request(Stream &strm, Request &req,
 
 inline bool
 ClientImpl::process_socket(const Socket &socket,
-                           std::function<bool(Stream &strm)> callback) {
+                           StreamManager callback) {
   return detail::process_client_socket(
       socket.sock, read_timeout_sec_, read_timeout_usec_, write_timeout_sec_,
       write_timeout_usec_, std::move(callback));
@@ -6502,6 +6571,27 @@ inline Result ClientImpl::Get(const char *path, Progress progress) {
 
 inline Result ClientImpl::Get(const char *path, const Headers &headers) {
   return Get(path, headers, Progress());
+}
+
+inline Result ClientImpl::Get(const char *path, const Headers &headers,
+                              CustomProtocolHandlers &protocol_handlers,
+                              const char *force_protocol) {
+  return Get(path, headers, nullptr, protocol_handlers, force_protocol);
+};
+
+inline Result ClientImpl::Get(const char *path, const Headers &headers,
+                              ResponseHandler response_handler,
+                              CustomProtocolHandlers &protocol_handlers,
+                              const char *force_protocol) {
+  Request req;
+  req.method = "GET";
+  req.path = path;
+  req.headers = headers;
+  req.alt_protocol_handlers = protocol_handlers;
+  req.forced_alt_protocol = force_protocol;
+  req.response_handler = std::move(response_handler);
+
+  return send_(std::move(req));
 }
 
 inline Result ClientImpl::Get(const char *path, const Headers &headers,
@@ -7650,7 +7740,7 @@ inline void SSLClient::shutdown_ssl_impl(Socket &socket,
 
 inline bool
 SSLClient::process_socket(const Socket &socket,
-                          std::function<bool(Stream &strm)> callback) {
+                          StreamManager callback) {
   assert(socket.ssl);
   return detail::process_client_socket_ssl(
       socket.ssl, socket.sock, read_timeout_sec_, read_timeout_usec_,
@@ -7853,6 +7943,17 @@ inline bool Client::is_valid() const {
 inline Result Client::Get(const char *path) { return cli_->Get(path); }
 inline Result Client::Get(const char *path, const Headers &headers) {
   return cli_->Get(path, headers);
+}
+inline Result Client::Get(const char *path, const Headers &headers,
+                          CustomProtocolHandlers &protocol_handlers,
+                          const char *force_protocol) {
+  return cli_->Get(path, headers, protocol_handlers, force_protocol);
+}
+inline Result Client::Get(const char *path, const Headers &headers,
+                          ResponseHandler response_handler,
+                          CustomProtocolHandlers &protocol_handlers,
+                          const char *force_protocol) {
+  return cli_->Get(path, headers, std::move(response_handler), protocol_handlers, force_protocol);
 }
 inline Result Client::Get(const char *path, Progress progress) {
   return cli_->Get(path, std::move(progress));
